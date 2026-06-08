@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "summary-generator"
+version = "0.1.0"
+description = "A FastAPI service which generates summary for bigger documents."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Abhishek Sharma", email = "abhishekanand9962@gmail.com" }
+]
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",       # for async test client
+    "ruff>=0.4",
+]
+
+[project.scripts]
+serve = "summary_generator.main:start"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/summary_generator"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+src/summary-generator/__init__.py
+src/summary-generator/main.py
+src/summary_generator.egg-info/PKG-INFO
+src/summary_generator.egg-info/SOURCES.txt
+src/summary_generator.egg-info/dependency_links.txt
+src/summary_generator.egg-info/top_level.txt
+tests/test_main.py
