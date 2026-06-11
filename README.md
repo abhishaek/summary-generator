@@ -1,46 +1,67 @@
 # Summary Generator
 
-A FastAPI service that generates summaries for large documents, with user authentication and authorization.
+A FastAPI service that generates summaries for large documents using Google Gemini, with user authentication.
 
 ## Features
 
 - User registration with email validation, username uniqueness check, and bcrypt password hashing
 - JWT-based login with 24-hour token expiry
-- Role-based access control (default role: `user`)
+- Role stored per user (default: `user`); role is included in the JWT
+- Summarize plain text sent via JSON payload
+- Summarize uploaded files: `.txt`, `.html`, `.pdf` (max 5 MB)
+- Two summary formats: `bullet` (5 bullet points, default) or `paragraph`
+- HTML files are stripped of `<script>` and `<style>` tags before summarization
+- PDF files are extracted page-by-page before summarization
+- Large documents are automatically split into chunks and summarized using a map-reduce strategy when token count exceeds 100,000 tokens
+- All summary endpoints require a valid JWT token
 - Async PostgreSQL database via SQLAlchemy 2.0 and asyncpg
 - Database migrations managed with Alembic
-- Auto-generated API documentation via Swagger UI at `/docs`
+- Auto-generated API docs at `/docs`
 
 ## Project Structure
 
 ```
 src/summary_generator/
-├── main.py                  # FastAPI app, router registration, uvicorn entrypoint
-├── config.py                # All settings and environment variables
-├── database.py              # Async SQLAlchemy engine, session, Base class
-├── dependencies.py          # Shared FastAPI dependencies: DbDependency, UserDependency, get_current_user
+├── main.py                        # FastAPI app, router registration, uvicorn entrypoint
+├── config.py                      # All settings and environment variables
+├── database.py                    # Async SQLAlchemy engine, session, Base class
+├── dependencies.py                # JWT validation dependency: get_current_user, UserDependency
 ├── models/
-│   ├── __init__.py          # Exports all models
-│   └── user.py              # User table definition
+│   ├── __init__.py                # Exports all models
+│   └── user.py                    # User table: id, email, username, hashed_password, role, is_active, created_at
 ├── schemas/
 │   ├── __init__.py
-│   └── auth.py              # Pydantic models: CreateUserRequest, UserResponse, Token
+│   ├── auth.py                    # Pydantic models: CreateUserRequest, UserResponse, Token
+│   └── summary.py                 # Pydantic models: SummaryRequest, SummaryResponse
+├── routers/
+│   ├── __init__.py                # Central router aggregator — registers all routers into api_router
+│   ├── auth.py                    # Auth routes: POST /auth/register, POST /auth/login
+│   └── summary.py                 # Summary routes: POST /summary/text, POST /summary/file
 ├── services/
 │   ├── __init__.py
-│   └── auth.py              # Business logic: hash_password, verify_password, create_access_token, authenticate_user
-└── routers/
+│   ├── auth.py                    # hash_password, verify_password, create_access_token, authenticate_user
+│   ├── chunker.py                 # Token counting, text splitting for large documents
+│   └── gemini_service.py          # Gemini API calls: single-pass and map-reduce summarization
+├── parsers/
+│   ├── __init__.py                # Factory: extract_text(file_bytes, mime_type) -> str
+│   ├── text.py                    # Decode and normalize plain text bytes
+│   ├── html.py                    # Strip HTML tags, extract visible text via BeautifulSoup
+│   └── pdf.py                     # Extract text page-by-page via pypdf
+└── shared/
     ├── __init__.py
-    └── auth.py              # Auth HTTP routes: /register, /login
+    ├── gemini_client.py           # Single shared google-genai Client instance
+    └── parserHelper.py            # _normalize(): whitespace normalization used by all parsers
 
-alembic/                     # Database migration scripts
+alembic/                           # Database migration scripts
 tests/
-├── conftest.py              # Shared fixtures: test DB setup, table cleanup, HTTP client
-├── test_main.py             # Tests for core app endpoints
-└── test_auth.py             # Tests for auth endpoints
-pyproject.toml               # Project config and dependencies
-.env                         # Environment variables (not committed)
-start.sh                     # Start the server
-stop.sh                      # Stop the server
+├── conftest.py                    # Test DB setup, table cleanup, async HTTP client fixture
+├── test_main.py                   # Tests for GET /health
+├── test_auth.py                   # Tests for /auth/register and /auth/login endpoints
+└── test_services.py               # Unit tests for hash_password, verify_password, create_access_token
+pyproject.toml                     # Project config and dependencies
+.env                               # Environment variables (not committed)
+start.sh                           # Start the server
+stop.sh                            # Stop the server
 ```
 
 ## Requirements
@@ -60,8 +81,11 @@ Key dependencies:
 | `bcrypt` | Password hashing |
 | `python-jose[cryptography]` | JWT token creation and verification |
 | `python-dotenv` | Loads `.env` file |
-| `python-multipart` | Form data support for login |
+| `python-multipart` | Form data support for login and file uploads |
 | `email-validator` | Email format validation |
+| `google-genai` | Google Gemini API client |
+| `pypdf` | PDF text extraction |
+| `beautifulsoup4` | HTML text extraction |
 
 ## Environment Variables
 
@@ -69,10 +93,14 @@ Create a `.env` file in the project root:
 
 ```env
 DATABASE_URL=postgresql+asyncpg://<user>:<password>@localhost:5432/<dbname>
+GOOGLE_GEMINI_API_KEY=your-gemini-api-key-here
 SECRET_KEY=your-secret-key-here
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
-`SECRET_KEY` is optional — a default is used if not set, but always set it in production.
+- `SECRET_KEY` is optional — a default is used if not set, but always set it in production.
+- `GEMINI_MODEL` is optional — defaults to `gemini-2.5-flash` if not set.
+- `GOOGLE_GEMINI_API_KEY` is required for summarization. Get a free key at [aistudio.google.com](https://aistudio.google.com).
 
 ## Installation
 
@@ -123,6 +151,8 @@ API docs: `http://localhost:8000/docs`
 | GET | `/health` | No | Returns service health status |
 | POST | `/auth/register` | No | Create a new user account |
 | POST | `/auth/login` | No | Login and receive a JWT token |
+| POST | `/summary/text` | Yes | Summarize plain text from JSON payload |
+| POST | `/summary/file` | Yes | Summarize an uploaded .txt, .html, or .pdf file |
 
 ### POST /auth/register
 
@@ -158,6 +188,49 @@ Response `200`:
   "token_type": "bearer"
 }
 ```
+
+### POST /summary/text
+
+Header: `Authorization: Bearer <token>`
+
+Request body:
+```json
+{
+  "text": "long text to summarize...",
+  "summary_format": "bullet"
+}
+```
+
+`summary_format` is optional — defaults to `bullet`. Accepted values: `bullet`, `paragraph`.
+
+Response `200`:
+```json
+{
+  "summary": [
+    "• First key point...",
+    "• Second key point...",
+    "• Third key point...",
+    "• Fourth key point...",
+    "• Fifth key point..."
+  ],
+  "source_type": "text"
+}
+```
+
+### POST /summary/file
+
+Header: `Authorization: Bearer <token>`
+
+Multipart form data:
+- `file`: the file to upload (`.txt`, `.html`, or `.pdf`, max 5 MB)
+- `summary_format`: optional, `bullet` (default) or `paragraph`
+
+Response `200`: same shape as `/summary/text` with `source_type: "file"`.
+
+Error responses:
+- `400` — empty text or no readable content found in file
+- `413` — file exceeds 5 MB
+- `415` — unsupported file type
 
 ## Running Tests
 
