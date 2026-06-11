@@ -1,10 +1,10 @@
 import uvicorn
 from fastapi import FastAPI, status
-from summary_generator.routers import auth
+from summary_generator.routers import api_router
 
 app = FastAPI()
 
-app.include_router(auth.router)
+app.include_router(api_router)
 
 
 @app.get("/health", status_code=status.HTTP_200_OK)
