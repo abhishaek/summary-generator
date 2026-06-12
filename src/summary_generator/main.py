@@ -23,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],              
 )
 
-@app.get("/")
+@app.get("/", status_code=status.HTTP_200_OK)
 def read_root():
     return {"message": "CORS-enabled response"}
 

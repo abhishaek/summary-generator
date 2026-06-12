@@ -5,7 +5,9 @@ A FastAPI service that generates summaries for large documents using Google Gemi
 ## Features
 
 - User registration with email validation, username uniqueness check, and bcrypt password hashing
-- JWT-based login with 24-hour token expiry
+- JWT-based login with 15-minute access token expiry
+- Refresh token support: issue, rotate, and invalidate refresh tokens (7-day expiry, stored hashed in DB)
+- Logout endpoint that invalidates the refresh token
 - Role stored per user (default: `user`); role is included in the JWT
 - Summarize plain text sent via JSON payload
 - Summarize uploaded files: `.txt`, `.html`, `.pdf` (max 5 MB)
@@ -13,7 +15,11 @@ A FastAPI service that generates summaries for large documents using Google Gemi
 - HTML files are stripped of `<script>` and `<style>` tags before summarization
 - PDF files are extracted page-by-page before summarization
 - Large documents are automatically split into chunks and summarized using a map-reduce strategy when token count exceeds 100,000 tokens
+- File MIME type detected via `python-magic` (not file extension)
 - All summary endpoints require a valid JWT token
+- Rate limiting on auth endpoints: register (3/min), login (5/min), refresh (10/min)
+- CORS enabled for all origins
+- Structured logging with configurable log level
 - Async PostgreSQL database via SQLAlchemy 2.0 and asyncpg
 - Database migrations managed with Alembic
 - Auto-generated API docs at `/docs`
@@ -22,24 +28,27 @@ A FastAPI service that generates summaries for large documents using Google Gemi
 
 ```
 src/summary_generator/
-├── main.py                        # FastAPI app, router registration, uvicorn entrypoint
+├── main.py                        # FastAPI app, CORS, rate limit error handler, uvicorn entrypoint
 ├── config.py                      # All settings and environment variables
 ├── database.py                    # Async SQLAlchemy engine, session, Base class
 ├── dependencies.py                # JWT validation dependency: get_current_user, UserDependency
+├── limiter.py                     # Shared slowapi Limiter instance (keyed by remote IP)
+├── logging_config.py              # Structured logging configuration; reads LOG_LEVEL env var
 ├── models/
 │   ├── __init__.py                # Exports all models
-│   └── user.py                    # User table: id, email, username, hashed_password, role, is_active, created_at
+│   ├── user.py                    # User table: id, email, username, hashed_password, role, is_active, created_at
+│   └── refresh_token.py           # RefreshToken table: id, user_id, token_hash, expires_at, created_at
 ├── schemas/
 │   ├── __init__.py
-│   ├── auth.py                    # Pydantic models: CreateUserRequest, UserResponse, Token
+│   ├── auth.py                    # Pydantic models: CreateUserRequest, UserResponse, Token, RefreshRequest
 │   └── summary.py                 # Pydantic models: SummaryRequest, SummaryResponse
 ├── routers/
 │   ├── __init__.py                # Central router aggregator — registers all routers into api_router
-│   ├── auth.py                    # Auth routes: POST /auth/register, POST /auth/login
-│   └── summary.py                 # Summary routes: POST /summary/text, POST /summary/file
+│   ├── auth.py                    # Auth routes: register, login, refresh, logout
+│   └── summary.py                 # Summary routes: POST /summary/v1/text, POST /summary/v1/file
 ├── services/
 │   ├── __init__.py
-│   ├── auth.py                    # hash_password, verify_password, create_access_token, authenticate_user
+│   ├── auth.py                    # hash_password, verify_password, create_access_token, refresh token helpers
 │   ├── chunker.py                 # Token counting, text splitting for large documents
 │   └── gemini_service.py          # Gemini API calls: single-pass and map-reduce summarization
 ├── parsers/
@@ -56,7 +65,7 @@ alembic/                           # Database migration scripts
 tests/
 ├── conftest.py                    # Test DB setup, table cleanup, async HTTP client fixture
 ├── test_main.py                   # Tests for GET /health
-├── test_auth.py                   # Tests for /auth/register and /auth/login endpoints
+├── test_auth.py                   # Tests for /auth/v1/register and /auth/v1/login endpoints
 └── test_services.py               # Unit tests for hash_password, verify_password, create_access_token
 pyproject.toml                     # Project config and dependencies
 .env                               # Environment variables (not committed)
@@ -86,6 +95,9 @@ Key dependencies:
 | `google-genai` | Google Gemini API client |
 | `pypdf` | PDF text extraction |
 | `beautifulsoup4` | HTML text extraction |
+| `python-magic` | MIME type detection from file bytes |
+| `slowapi` | Rate limiting |
+| `python-json-logger` | Structured logging formatter |
 
 ## Environment Variables
 
@@ -96,10 +108,12 @@ DATABASE_URL=postgresql+asyncpg://<user>:<password>@localhost:5432/<dbname>
 GOOGLE_GEMINI_API_KEY=your-gemini-api-key-here
 SECRET_KEY=your-secret-key-here
 GEMINI_MODEL=gemini-2.5-flash
+LOG_LEVEL=INFO
 ```
 
 - `SECRET_KEY` is optional — a default is used if not set, but always set it in production.
 - `GEMINI_MODEL` is optional — defaults to `gemini-2.5-flash` if not set.
+- `LOG_LEVEL` is optional — defaults to `INFO`. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
 - `GOOGLE_GEMINI_API_KEY` is required for summarization. Get a free key at [aistudio.google.com](https://aistudio.google.com).
 
 ## Installation
@@ -148,13 +162,16 @@ API docs: `http://localhost:8000/docs`
 
 | Method | Path | Auth Required | Description |
 |---|---|---|---|
+| GET | `/` | No | Root endpoint, confirms CORS is active |
 | GET | `/health` | No | Returns service health status |
-| POST | `/auth/register` | No | Create a new user account |
-| POST | `/auth/login` | No | Login and receive a JWT token |
-| POST | `/summary/text` | Yes | Summarize plain text from JSON payload |
-| POST | `/summary/file` | Yes | Summarize an uploaded .txt, .html, or .pdf file |
+| POST | `/auth/v1/register` | No | Create a new user account |
+| POST | `/auth/v1/login` | No | Login and receive access + refresh tokens |
+| POST | `/auth/v1/refresh` | No | Exchange a refresh token for new access + refresh tokens |
+| POST | `/auth/v1/logout` | Yes | Invalidate the supplied refresh token |
+| POST | `/summary/v1/text` | Yes | Summarize plain text from JSON payload |
+| POST | `/summary/v1/file` | Yes | Summarize an uploaded .txt, .html, or .pdf file |
 
-### POST /auth/register
+### POST /auth/v1/register
 
 Request body:
 ```json
@@ -177,7 +194,9 @@ Response `201`:
 }
 ```
 
-### POST /auth/login
+Rate limit: 3 requests/minute per IP.
+
+### POST /auth/v1/login
 
 Form data: `username`, `password`
 
@@ -185,11 +204,42 @@ Response `200`:
 ```json
 {
   "access_token": "<jwt_token>",
-  "token_type": "bearer"
+  "token_type": "bearer",
+  "refresh_token": "<opaque_token>"
 }
 ```
 
-### POST /summary/text
+Access token expires in 15 minutes. Refresh token expires in 7 days.
+
+Rate limit: 5 requests/minute per IP.
+
+### POST /auth/v1/refresh
+
+Request body:
+```json
+{
+  "refresh_token": "<opaque_token>"
+}
+```
+
+Response `200`: same shape as login. The old refresh token is deleted and a new one is issued (token rotation).
+
+Rate limit: 10 requests/minute per IP.
+
+### POST /auth/v1/logout
+
+Header: `Authorization: Bearer <token>`
+
+Request body:
+```json
+{
+  "refresh_token": "<opaque_token>"
+}
+```
+
+Response `204 No Content`. Deletes the refresh token from the database.
+
+### POST /summary/v1/text
 
 Header: `Authorization: Bearer <token>`
 
@@ -217,7 +267,7 @@ Response `200`:
 }
 ```
 
-### POST /summary/file
+### POST /summary/v1/file
 
 Header: `Authorization: Bearer <token>`
 
@@ -225,12 +275,12 @@ Multipart form data:
 - `file`: the file to upload (`.txt`, `.html`, or `.pdf`, max 5 MB)
 - `summary_format`: optional, `bullet` (default) or `paragraph`
 
-Response `200`: same shape as `/summary/text` with `source_type: "file"`.
+Response `200`: same shape as `/summary/v1/text` with `source_type: "file"`.
 
 Error responses:
 - `400` — empty text or no readable content found in file
 - `413` — file exceeds 5 MB
-- `415` — unsupported file type
+- `415` — unsupported file type (detected by MIME type, not file extension)
 
 ## Running Tests
 
