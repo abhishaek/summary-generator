@@ -1,9 +1,12 @@
+import logging
 from google.genai import errors as genai_errors
 from fastapi import HTTPException
 
 from summary_generator.config import GEMINI_MODEL, SUMMARY_MAX_TOKENS
 from summary_generator.services.chunker import chunk_text
 from summary_generator.shared.gemini_client import client
+
+logger = logging.getLogger(__name__)
 
 
 def _format_instructions(summary_format: str) -> str:
@@ -50,20 +53,26 @@ def _build_reduce_prompt(joined_summaries: str, summary_format: str) -> str:
 
 
 async def _call_gemini(prompt: str) -> str:
+    logger.debug("Calling Gemini API: model=%s max_tokens=%d", GEMINI_MODEL, SUMMARY_MAX_TOKENS)
     try:
         response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config={"max_output_tokens": SUMMARY_MAX_TOKENS},
         )
+        logger.debug("Gemini API call succeeded")
         return response.text
     except genai_errors.APIError as e:
         if hasattr(e, "code") and e.code == 429:
+            logger.warning("Gemini rate limit hit")
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
         if hasattr(e, "code") and e.code == 400:
+            logger.error("Gemini bad request: %s", str(e))
             raise HTTPException(status_code=400, detail=f"Invalid request: {str(e)}")
+        logger.error("Gemini API error: %s", str(e))
         raise HTTPException(status_code=500, detail="Gemini API error. Please try again.")
-    except Exception:
+    except Exception as e:
+        logger.error("Unexpected error calling Gemini: %s", str(e))
         raise HTTPException(status_code=500, detail="Unexpected error while generating summary.")
 
 
@@ -71,15 +80,19 @@ async def summarize(text: str, summary_format: str) -> str:
     chunks = chunk_text(text)
 
     if len(chunks) == 1:
+        logger.debug("Single chunk: sending directly to Gemini")
         prompt = _build_prompt(chunks[0], summary_format)
         return await _call_gemini(prompt)
 
+    logger.info("Large document: processing %d chunks then reducing", len(chunks))
     chunk_summaries = []
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks, 1):
+        logger.debug("Summarizing chunk %d/%d", i, len(chunks))
         prompt = _build_prompt(chunk, summary_format)
         summary = await _call_gemini(prompt)
         chunk_summaries.append(summary)
 
+    logger.debug("Reducing %d chunk summaries into final summary", len(chunk_summaries))
     joined = "\n\n".join(chunk_summaries)
     reduce_prompt = _build_reduce_prompt(joined, summary_format)
     return await _call_gemini(reduce_prompt)

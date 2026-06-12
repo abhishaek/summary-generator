@@ -1,5 +1,8 @@
+import logging
 from summary_generator.config import GEMINI_MODEL, MAX_TOKENS_PER_CHUNK
 from summary_generator.shared.gemini_client import client
+
+logger = logging.getLogger(__name__)
 
 CHUNK_OVERLAP_TOKENS = 200
 
@@ -28,7 +31,11 @@ def split_into_chunks(text: str) -> list[str]:
 
 def chunk_text(text: str) -> list[str]:
     total_tokens = count_tokens(text)
+    logger.debug("Token count: %d (limit=%d)", total_tokens, MAX_TOKENS_PER_CHUNK)
 
     if total_tokens <= MAX_TOKENS_PER_CHUNK:
         return [text]
-    return split_into_chunks(text)
+
+    chunks = split_into_chunks(text)
+    logger.info("Text split into %d chunks (total_tokens=%d)", len(chunks), total_tokens)
+    return chunks
