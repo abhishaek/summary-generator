@@ -14,8 +14,16 @@ def setup_logging():
                 "datefmt": "%Y-%m-%d %H:%M:%S",
             },
             "access": {
-                "()": "logging.Formatter",
+                # Uvicorn's own formatter: it synthesizes client_addr / request_line /
+                # status_code from record.args (a plain logging.Formatter cannot).
+                "()": "uvicorn.logging.AccessFormatter",
                 "fmt": "%(asctime)s - %(levelname)s - %(client_addr)s - '%(request_line)s' %(status_code)s",
+                "datefmt": "%Y-%m-%d %H:%M:%S",
+                "use_colors": False,
+            },
+            "uvicorn": {                      # ← no %(name)s, hides the noisy "uvicorn.error"
+                "()": "logging.Formatter",
+                "fmt": "%(asctime)s - %(levelname)s - %(message)s",
                 "datefmt": "%Y-%m-%d %H:%M:%S",
             },
         },
@@ -30,6 +38,11 @@ def setup_logging():
                 "formatter": "access",
                 "stream": "ext://sys.stdout",
             },
+            "uvicorn_console": {
+                "class": "logging.StreamHandler",
+                "formatter": "uvicorn",
+                "stream": "ext://sys.stdout",
+            },
         },
         "loggers": {
             "summary_generator": {        # ← matches all your submodules
@@ -38,7 +51,12 @@ def setup_logging():
                 "propagate": False,
             },
             "uvicorn": {
-                "handlers": ["console"],
+                "handlers": ["uvicorn_console"],
+                "level": "INFO",
+                "propagate": False,
+            },
+            "uvicorn.error": {            # ← configured explicitly so it stops bubbling to "uvicorn"
+                "handlers": ["uvicorn_console"],
                 "level": "INFO",
                 "propagate": False,
             },

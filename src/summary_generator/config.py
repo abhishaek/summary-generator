@@ -15,3 +15,6 @@ GEMINI_API_KEY: str = os.getenv("GOOGLE_GEMINI_API_KEY")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 MAX_TOKENS_PER_CHUNK: int = 100_000
 SUMMARY_MAX_TOKENS: int = 4_096
+
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+EMBEDDING_DIM: int = 384  # output dimension of all-MiniLM-L6-v2
