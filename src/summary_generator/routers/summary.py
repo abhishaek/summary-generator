@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/summary",
-    tags=["summary"],
+    tags=["Summary"],
     dependencies=[Depends(get_current_user)],
 )
 

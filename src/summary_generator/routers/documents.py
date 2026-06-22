@@ -1,19 +1,17 @@
 import logging
 
-from fastapi import APIRouter, Depends, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 
 from summary_generator.dependencies import get_current_user, DbDependency, UserDependency
-from summary_generator.models.document import Document, DocumentChunk
-from summary_generator.schemas.document import DocumentResponse
-from summary_generator.services.chunker import chunk_text
-from summary_generator.services.embedder import embed_chunks
-from summary_generator.shared.file_validation import extract_document_text
+from summary_generator.schemas.document import DocumentResponse, DocumentTextRequest
+from summary_generator.services.document_service import ingest_document
+from summary_generator.shared.file_validation import extract_document_pages
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/documents",
-    tags=["documents"],
+    tags=["Documents"],
     dependencies=[Depends(get_current_user)],
 )
 
@@ -25,25 +23,32 @@ async def create_document(
     current_user: UserDependency,
 ):
     contents = await file.read()
-    text, mime_type = extract_document_text(contents, file.filename)
+    pages, mime_type = extract_document_pages(contents, file.filename)
 
-    chunks = chunk_text(text)
-    embeddings = await embed_chunks(chunks)
+    logger.info("Document ingest: source=file filename=%s mime_type=%s pages=%d", file.filename, mime_type, len(pages))
+    document, chunks_stored = await ingest_document(db, current_user["id"], file.filename, pages)
 
-    logger.info(
-        "Document ingest: filename=%s mime_type=%s chunks=%d",
-        file.filename, mime_type, len(chunks),
+    return DocumentResponse(
+        document_id=document.id, filename=document.filename, chunks_stored=chunks_stored
     )
 
-    document = Document(user_id=current_user["id"], filename=file.filename)
-    document.chunks = [
-        DocumentChunk(chunk_index=i, content=chunk, embedding=embedding)
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-    ]
 
-    db.add(document)
-    await db.commit()
-    await db.refresh(document)
+@router.post("/text", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
+async def create_document_from_text(
+    payload: DocumentTextRequest,
+    db: DbDependency,
+    current_user: UserDependency,
+):
+    if not payload.text.strip():
+        logger.warning("Rejected /documents/text: empty text body")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Text cannot be empty.")
 
-    logger.info("Document stored: id=%d chunks=%d filename=%s", document.id, len(chunks), file.filename)
-    return DocumentResponse(document_id=document.id, filename=document.filename, chunks_stored=len(chunks))
+    # Raw text has no pages; treat the whole input as a single page.
+    pages = [(1, payload.text)]
+
+    logger.info("Document ingest: source=text title=%s chars=%d", payload.title, len(payload.text))
+    document, chunks_stored = await ingest_document(db, current_user["id"], payload.title, pages)
+
+    return DocumentResponse(
+        document_id=document.id, filename=document.filename, chunks_stored=chunks_stored
+    )

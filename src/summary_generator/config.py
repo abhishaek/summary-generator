@@ -18,3 +18,8 @@ SUMMARY_MAX_TOKENS: int = 4_096
 
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_DIM: int = 384  # output dimension of all-MiniLM-L6-v2
+
+# Retrieval chunks must stay well under the embedding model's 256-token input
+# limit, otherwise text past the limit is truncated before it is embedded.
+RETRIEVAL_CHUNK_TOKENS: int = 200
+RETRIEVAL_CHUNK_OVERLAP_TOKENS: int = 40
