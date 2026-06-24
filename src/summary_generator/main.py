@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,9 +9,20 @@ from slowapi.errors import RateLimitExceeded
 from summary_generator.limiter import limiter
 from summary_generator.routers import api_router
 from summary_generator.logging_config import setup_logging
+from summary_generator.services.embedder import warmup_model
 
 setup_logging()
-app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the embedding model at startup so the first /documents request does
+    # not pay the one-time model-load cost.
+    warmup_model()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 

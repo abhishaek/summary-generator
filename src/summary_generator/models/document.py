@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Integer, String, Text, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -11,10 +11,15 @@ from summary_generator.database import Base
 
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (
+        UniqueConstraint("user_id", "content_hash", name="uq_documents_user_content_hash"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     filename: Mapped[str | None] = mapped_column(String, nullable=True)
+    # sha256 of the extracted, normalized text; used to dedup re-uploads per user.
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     chunks: Mapped[list["DocumentChunk"]] = relationship(

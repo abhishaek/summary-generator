@@ -10,7 +10,7 @@ from summary_generator.database import get_db
 
 logger = logging.getLogger(__name__)
 
-oauth2_bearer = OAuth2PasswordBearer(tokenUrl="auth/login")
+oauth2_bearer = OAuth2PasswordBearer(tokenUrl="auth/v1/login")
 
 DbDependency = Annotated[AsyncSession, Depends(get_db)]
 
