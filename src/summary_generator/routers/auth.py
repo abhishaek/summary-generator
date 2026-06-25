@@ -26,7 +26,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
     "/v1/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED
 )
 @limiter.limit("3/minute")
-async def register_user(payload: CreateUserRequest, db: DbDependency):
+async def register_user(request: Request, payload: CreateUserRequest, db: DbDependency):
     existing = await db.execute(
         select(User).where(
             (User.email == payload.email) | (User.username == payload.username)

@@ -7,7 +7,16 @@ from sqlalchemy.sql import func
 
 from summary_generator.config import EMBEDDING_DIM
 from summary_generator.database import Base
+import enum
 
+
+
+class JobStatus(str, enum.Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DONE = "done"
+    FAILED = "failed"
+    DUPLICATE = "duplicate"
 
 class Document(Base):
     __tablename__ = "documents"
@@ -20,6 +29,12 @@ class Document(Base):
     filename: Mapped[str | None] = mapped_column(String, nullable=True)
     # sha256 of the extracted, normalized text; used to dedup re-uploads per user.
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Ingestion lifecycle: pending -> processing -> done | failed | duplicate.
+    # Set when the upload is accepted; advanced by the background task.
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default=JobStatus.PENDING.value)
+    chunks_stored: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     chunks: Mapped[list["DocumentChunk"]] = relationship(

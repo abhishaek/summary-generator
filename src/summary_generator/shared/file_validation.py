@@ -7,19 +7,19 @@ from summary_generator.parsers import extract_text, extract_pages, DOCX_MIME_TYP
 
 logger = logging.getLogger(__name__)
 
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
 SUPPORTED_MIME_TYPES = {"text/plain", "text/html", "application/pdf", DOCX_MIME_TYPE, MARKDOWN_MIME_TYPE}
 MARKDOWN_EXTENSIONS = (".md", ".markdown")
 
 
-def _validate(contents: bytes, filename: str | None) -> str:
+def validate_file(contents: bytes, filename: str | None) -> str:
     """Check size and type of an uploaded file. Returns the detected mime_type,
     or raises HTTPException (413/415)."""
     if len(contents) > MAX_FILE_SIZE:
         logger.warning("Rejected file: too large bytes=%d filename=%s", len(contents), filename)
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="File size exceeds the 5 MB limit.",
+            detail="File size exceeds the 15 MB limit.",
         )
 
     mime_type = magic.from_buffer(contents, mime=True)
@@ -43,7 +43,7 @@ def extract_document_text(contents: bytes, filename: str | None = None) -> tuple
 
     Returns a (text, mime_type) tuple. Raises HTTPException (413/415/400).
     """
-    mime_type = _validate(contents, filename)
+    mime_type = validate_file(contents, filename)
     text = extract_text(contents, mime_type)
 
     if not text.strip():
@@ -62,7 +62,7 @@ def extract_document_pages(contents: bytes, filename: str | None = None) -> tupl
     Returns a (pages, mime_type) tuple where pages is a list of
     (page_number, text); empty pages are dropped. Raises HTTPException (413/415/400).
     """
-    mime_type = _validate(contents, filename)
+    mime_type = validate_file(contents, filename)
     pages = [(num, text) for num, text in extract_pages(contents, mime_type) if text.strip()]
 
     if not pages:
