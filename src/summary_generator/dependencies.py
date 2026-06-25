@@ -23,14 +23,33 @@ async def get_current_user(token: str = Depends(oauth2_bearer)):
         role: str = payload.get("role")
         if username is None or user_id is None:
             logger.warning("Token missing required claims: sub or id absent")
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials.",
+            )
         return {"username": username, "id": user_id, "role": role}
     except ExpiredSignatureError:
         logger.warning("Expired token used")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired. Please log in again.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired. Please log in again.",
+        )
     except JWTError:
         logger.warning("Invalid token: signature or format error")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials.",
+        )
 
+
+def require_role(*allowed_roles: str):
+    def checker(user: UserDependency):
+        if user["role"] not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient Permissions"
+            )
+        return user
+    return checker
 
 UserDependency = Annotated[dict, Depends(get_current_user)]
+AdminDependency = Annotated[dict, Depends(require_role("admin"))]
