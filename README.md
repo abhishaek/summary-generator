@@ -11,12 +11,15 @@ It exposes JWT-authenticated endpoints to summarize text and uploaded files with
 - Refresh token support: issue, rotate, and invalidate refresh tokens (7-day expiry, stored hashed in the DB)
 - Logout endpoint that deletes the supplied refresh token
 - Summarize plain text sent via JSON payload
-- Summarize uploaded files: `.txt`, `.md`, `.html`, `.pdf`, `.docx` (max 5 MB)
+- Summarize uploaded files: `.txt`, `.md`, `.html`, `.pdf`, `.docx` (max 15 MB)
 - Two summary formats: `bullet` (5 bullet points, default) or `paragraph`
 - File type detected via MIME sniffing (`python-magic`), not file extension; Markdown is routed by extension because it sniffs as plain text
 - Parsers normalize whitespace; HTML strips `<script>`/`<style>`, Markdown is rendered then stripped to prose, PDF is extracted page-by-page, DOCX is extracted paragraph-by-paragraph
 - Large documents are automatically split into chunks and summarized with a map-reduce strategy when the token count exceeds 100,000 tokens
 - Document ingestion endpoints: upload a file or post raw text, which is chunked into small retrieval-sized windows, embedded locally with `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim), and stored in PostgreSQL via `pgvector`
+- File ingestion (`POST /documents`) runs asynchronously: the request returns `202 Accepted` immediately with a `document_id`, and the parse/chunk/embed/store work runs in a FastAPI background task; clients poll `GET /documents/{document_id}` for status
+- Ingestion status lifecycle per document: `pending` → `processing` → `done` | `failed` | `duplicate`, with the failure reason stored on the row
+- Per-user content deduplication: documents are hashed by their extracted text (sha256), so re-uploading the same content (even renamed or in a different format) is detected and not re-ingested
 - Each stored chunk keeps its source page number and character offset within the page
 - All summary and document endpoints require a valid JWT
 - Rate limiting on auth endpoints: register (3/min), login (5/min), refresh (10/min), keyed by remote IP
@@ -39,24 +42,24 @@ src/summary_generator/
 │   ├── __init__.py                # Exports all models
 │   ├── user.py                    # User table
 │   ├── refresh_token.py           # RefreshToken table (hashed token, expiry)
-│   └── document.py                # Document and DocumentChunk tables (pgvector embedding column)
+│   └── document.py                # Document and DocumentChunk tables (pgvector embedding column); JobStatus enum, ingestion status columns
 ├── schemas/
 │   ├── __init__.py
 │   ├── auth.py                    # CreateUserRequest, UserResponse, Token, RefreshRequest
 │   ├── summary.py                 # SummaryRequest, SummaryResponse
-│   └── document.py                # DocumentTextRequest, DocumentResponse
+│   └── document.py                # DocumentTextRequest, DocumentResponse (id, filename, chunks_stored, status, error)
 ├── routers/
 │   ├── __init__.py                # Aggregates auth, summary, documents routers into api_router
 │   ├── auth.py                    # /auth: register, login, refresh, logout
 │   ├── summary.py                 # /summary: POST /v1/text, POST /v1/file
-│   └── documents.py               # /documents: POST "" (file), POST /text
+│   └── documents.py               # /documents: POST "" (file, async 202), POST /text, GET /{document_id} (status)
 ├── services/
 │   ├── __init__.py
 │   ├── auth.py                    # Password hashing, JWT creation, refresh-token helpers
 │   ├── chunker.py                 # Token counting, map-reduce splitting, retrieval-chunk splitting
 │   ├── gemini_service.py          # Gemini calls: single-pass and map-reduce summarization
 │   ├── embedder.py                # Lazy sentence-transformers singleton; embeds chunks off the event loop
-│   └── document_service.py        # Chunk + embed + persist a document and its chunks
+│   └── document_service.py        # ingest_document (sync, text path), process_document (background task, file path), dedup helpers
 ├── parsers/
 │   ├── __init__.py                # extract_text() and extract_pages() dispatch by MIME type
 │   ├── text.py                    # Decode and normalize plain text
@@ -168,8 +171,9 @@ API docs: `http://localhost:8000/docs`
 | POST | `/auth/v1/logout` | Yes | Invalidate the supplied refresh token |
 | POST | `/summary/v1/text` | Yes | Summarize plain text from a JSON payload |
 | POST | `/summary/v1/file` | Yes | Summarize an uploaded file |
-| POST | `/documents` | Yes | Ingest an uploaded file: chunk, embed, and store |
-| POST | `/documents/text` | Yes | Ingest raw text: chunk, embed, and store |
+| POST | `/documents` | Yes | Accept an uploaded file for ingestion; returns `202` and processes in the background |
+| POST | `/documents/text` | Yes | Ingest raw text synchronously: chunk, embed, and store |
+| GET | `/documents/{document_id}` | Yes | Get the ingestion status and result of a document |
 
 ### POST /auth/v1/register
 
@@ -262,14 +266,14 @@ Response `200`:
 Header: `Authorization: Bearer <token>`
 
 Multipart form data:
-- `file`: the file to upload (`.txt`, `.md`, `.html`, `.pdf`, `.docx`, max 5 MB)
+- `file`: the file to upload (`.txt`, `.md`, `.html`, `.pdf`, `.docx`, max 15 MB)
 - `summary_format`: optional, `bullet` (default) or `paragraph`
 
 Response `200`: same shape as `/summary/v1/text` with `source_type: "file"`.
 
 Error responses:
 - `400` — empty text, no readable content found, or invalid `summary_format`
-- `413` — file exceeds 5 MB
+- `413` — file exceeds 15 MB
 - `415` — unsupported file type (detected by MIME type, not extension)
 
 ### POST /documents
@@ -277,18 +281,48 @@ Error responses:
 Header: `Authorization: Bearer <token>`
 
 Multipart form data:
-- `file`: the file to upload (`.txt`, `.md`, `.html`, `.pdf`, `.docx`, max 5 MB)
+- `file`: the file to upload (`.txt`, `.md`, `.html`, `.pdf`, `.docx`, max 15 MB)
 
-The file is validated, extracted per page, split into retrieval-sized chunks, embedded locally, and stored.
+The upload is validated (size and MIME type) on the request, a `pending` document row is created, and the heavy work (extract per page, split into retrieval-sized chunks, embed locally, store) is handed to a background task. The request returns immediately.
 
-Response `201`:
+Response `202`:
 ```json
 {
   "document_id": 1,
   "filename": "report.pdf",
-  "chunks_stored": 12
+  "chunks_stored": 0,
+  "status": "pending",
+  "error": null
 }
 ```
+
+Poll `GET /documents/{document_id}` to follow progress. The status moves `pending` → `processing` → `done`. If the same content was already ingested by this user it ends as `duplicate`; if processing fails it ends as `failed` with the reason in `error`.
+
+Error responses (returned on the request, before queuing):
+- `413` — file exceeds 15 MB
+- `415` — unsupported file type (detected by MIME type, not extension)
+
+### GET /documents/{document_id}
+
+Header: `Authorization: Bearer <token>`
+
+Returns the current ingestion status and result of a document owned by the caller.
+
+Response `200`:
+```json
+{
+  "document_id": 1,
+  "filename": "report.pdf",
+  "chunks_stored": 12,
+  "status": "done",
+  "error": null
+}
+```
+
+`status` is one of `pending`, `processing`, `done`, `failed`, `duplicate`. `chunks_stored` is populated once `status` is `done`; `error` carries the reason when `status` is `failed` or `duplicate`.
+
+Error response:
+- `404` — the document does not exist or is owned by another user
 
 ### POST /documents/text
 
@@ -302,7 +336,7 @@ Request body:
 }
 ```
 
-The whole input is treated as a single page, chunked, embedded, and stored. `title` is used as the document filename. Response `201`: same shape as `POST /documents`.
+The whole input is treated as a single page, chunked, embedded, and stored synchronously (no background task). `title` is used as the document filename. Response `201` with `status: "done"`; a re-upload of identical content returns `200` with the existing document.
 
 Error response:
 - `400` — empty text
