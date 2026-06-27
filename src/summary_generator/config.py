@@ -23,7 +23,7 @@ EMBEDDING_DIM: int = 384  # output dimension of all-MiniLM-L6-v2
 # limit, otherwise text past the limit is truncated before it is embedded.
 RETRIEVAL_CHUNK_TOKENS: int = 200
 RETRIEVAL_CHUNK_OVERLAP_TOKENS: int = 40
-RETRIEVAL_TOP_K: int = 5
+RETRIEVAL_TOP_K: int = 10
 RETRIEVAL_MAX_TOP_K: int = 40
 # Cosine similarity is in [-1, 1] for normalized vectors; relevant MiniLM
 # matches are typically ~0.3+. Drop anything below this as noise. Tune to taste.

@@ -349,6 +349,12 @@ Tests run against a separate `summary_test_db` database. Create it first (the te
 psql postgres -c "CREATE DATABASE summary_test_db;"
 psql postgres -c "GRANT ALL PRIVILEGES ON DATABASE summary_test_db TO summary_user;"
 psql postgres -c "ALTER DATABASE summary_test_db OWNER TO summary_user;"
+
+# Enable pgvector in the test DB (the DocumentChunk table uses a VECTOR column).
+# CREATE EXTENSION requires superuser, so run it as the postgres superuser once.
+# The test fixture also attempts this, but will skip if summary_user lacks the
+# privilege — so do it here to be safe.
+psql -d summary_test_db -c "CREATE EXTENSION IF NOT EXISTS vector;"
 ```
 
 Then run:

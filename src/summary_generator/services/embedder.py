@@ -54,14 +54,20 @@ def _encode(chunks: list[str]) -> list[list[float]]:
 async def embed_chunks(chunks: list[str]) -> list[list[float]]:
     """Embed each chunk into a vector. Runs the CPU-bound model in a worker
     thread so the async event loop is not blocked."""
+    print(f"[EMBED] Embedding {len(chunks)} chunk(s) with model={EMBEDDING_MODEL} (running in worker thread)")
     logger.debug("Embedding %d chunks", len(chunks))
-    return await anyio.to_thread.run_sync(_encode, chunks)
+    vectors = await anyio.to_thread.run_sync(_encode, chunks)
+    dim = len(vectors[0]) if vectors else 0
+    print(f"[EMBED] Produced {len(vectors)} embedding vector(s), dimension={dim}")
+    return vectors
 
 
 async def embed_query(text: str) -> list[float]:
     """Embed a single query string into a vector, produced the same way as the
     stored chunk vectors (same model, normalized) so cosine search is valid.
     Runs the CPU-bound model in a worker thread so the event loop is not blocked."""
+    print(f"[RETRIEVAL 3/8] Embedding query into a vector with model={EMBEDDING_MODEL}: chars={len(text)} (same model/normalization as stored chunks)")
     logger.debug("Embedding query (%d chars)", len(text))
     vectors = await anyio.to_thread.run_sync(_encode, [text])
+    print(f"[RETRIEVAL 4/8] Query embedded: vector dimension={len(vectors[0])}")
     return vectors[0]

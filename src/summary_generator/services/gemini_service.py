@@ -3,6 +3,7 @@ from google.genai import errors as genai_errors
 from fastapi import HTTPException
 
 from summary_generator.config import GEMINI_MODEL, SUMMARY_MAX_TOKENS
+from summary_generator.schemas.retrieval import RetrievedChunk
 from summary_generator.services.chunker import chunk_text
 from summary_generator.shared.gemini_client import client
 
@@ -52,13 +53,16 @@ def _build_reduce_prompt(joined_summaries: str, summary_format: str) -> str:
     )
 
 
-async def _call_gemini(prompt: str) -> str:
+async def _call_gemini(prompt: str, temperature: float | None = None) -> str:
     logger.debug("Calling Gemini API: model=%s max_tokens=%d", GEMINI_MODEL, SUMMARY_MAX_TOKENS)
+    config: dict = {"max_output_tokens": SUMMARY_MAX_TOKENS}
+    if temperature is not None:
+        config["temperature"] = temperature
     try:
         response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config={"max_output_tokens": SUMMARY_MAX_TOKENS},
+            config=config,
         )
         logger.debug("Gemini API call succeeded")
         return response.text
@@ -96,3 +100,47 @@ async def summarize(text: str, summary_format: str) -> str:
     joined = "\n\n".join(chunk_summaries)
     reduce_prompt = _build_reduce_prompt(joined, summary_format)
     return await _call_gemini(reduce_prompt)
+
+
+# Exact reply when retrieval returns nothing or the chunks don't answer the
+# query. Kept as a constant so the empty-retrieval short-circuit and the prompt
+# instruction stay in sync.
+NO_ANSWER = "The provided documents do not contain information to answer this."
+
+
+def _build_rag_context(chunks: list[RetrievedChunk]) -> str:
+    """Format retrieved chunks into numbered, source-tagged blocks so the model
+    can ground each claim and cite it as [Source N], and so a reader can trace a
+    claim back to a specific document/chunk/page."""
+    return "\n\n".join(
+        f"[Source {i} | document={c.document_id} chunk={c.chunk_index} page={c.page_number}]\n{c.content}"
+        for i, c in enumerate(chunks, start=1)
+    )
+
+
+def _build_rag_prompt(query: str, context: str) -> str:
+    return (
+        "You are a question-answering assistant working strictly from retrieved document excerpts.\n"
+        "Strict rules:\n"
+        "- Use ONLY information explicitly present in the numbered sources below.\n"
+        "- Do NOT add facts, context, or knowledge from outside the sources.\n"
+        "- Do NOT make assumptions or inferences beyond what is written.\n"
+        "- Cite the sources you rely on inline as [Source N].\n"
+        f'- If the sources do not contain the answer, reply EXACTLY: "{NO_ANSWER}"\n\n'
+        f"Question:\n{query}\n\n"
+        f"Sources:\n{context}"
+    )
+
+
+async def answer_from_chunks(query: str, chunks: list[RetrievedChunk]) -> str:
+    """Produce a grounded answer to `query` using ONLY the retrieved `chunks`.
+
+    Short-circuits when retrieval found nothing — sending Gemini an empty context
+    is the main way it starts inventing answers — and uses temperature 0 to keep
+    the output deterministic and tied to the provided text.
+    """
+    if not chunks:
+        logger.info("RAG answer skipped: no chunks retrieved")
+        return NO_ANSWER
+    prompt = _build_rag_prompt(query, _build_rag_context(chunks))
+    return await _call_gemini(prompt, temperature=0)

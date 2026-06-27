@@ -13,6 +13,29 @@ logger = logging.getLogger(__name__)
 
 CHUNK_OVERLAP_TOKENS = 200
 
+# Table-of-contents / index lines render as "Heading .............. 42": a label,
+# a long run of dot leaders, then a page number. They are keyword-dense but carry
+# no real information, and in similarity search they crowd out the actual content
+# (e.g. a query for "CloudFormation" matches a dozen TOC rows before the prose
+# that explains it). Drop any chunk dominated by dot-leader filler. Require a real
+# leader run (4+ dots) AND a high dot ratio so ordinary prose with ellipses or
+# abbreviations is never discarded.
+_DOT_LEADER_RE = re.compile(r"\.\s*\.\s*\.\s*\.+")
+_DOT_RATIO_THRESHOLD = 0.15
+
+
+def _is_toc_noise(line: str) -> bool:
+    if not _DOT_LEADER_RE.search(line):
+        return False
+    return line.count(".") / max(len(line), 1) > _DOT_RATIO_THRESHOLD
+
+
+def _strip_toc_lines(text: str) -> str:
+    """Remove table-of-contents/index lines before chunking. Done per line (not
+    per chunk) so a chunk that mixes a stray TOC row with real prose keeps the
+    prose instead of being discarded whole."""
+    return "\n".join(line for line in text.splitlines() if not _is_toc_noise(line))
+
 
 def count_tokens(text: str) -> int:
     response = client.models.count_tokens(model=GEMINI_MODEL, contents=text)
@@ -45,7 +68,9 @@ def split_into_chunks(text: str) -> list[str]:
         if end >= len(words):
             break
 
-        pos = max(end - overlap_in_words, pos + 1)
+        # Cap overlap to half the chunk's words so a chunk shrunk below the
+        # overlap size can't make the window crawl forward one word at a time.
+        pos = end - min(overlap_in_words, (end - pos) // 2)
 
     return chunks
 
@@ -77,8 +102,15 @@ def chunk_for_embedding(text: str) -> list[tuple[str, int]]:
     # model's own tokenizer — Gemini's count_tokens does not apply here.
     from summary_generator.services.embedder import count_embedding_tokens
 
+    # Drop table-of-contents/index lines before windowing so they neither become
+    # chunks nor pollute neighbouring ones. char_start is then an offset into this
+    # cleaned text rather than the raw page text.
+    text = _strip_toc_lines(text)
+
     words = list(re.finditer(r"\S+", text))
+    print(f"[CHUNK] Chunking page text: chars={len(text)} words={len(words)} target_tokens_per_chunk={RETRIEVAL_CHUNK_TOKENS} overlap_tokens={RETRIEVAL_CHUNK_OVERLAP_TOKENS}")
     if not words:
+        print("[CHUNK] Page has no words; produced 0 chunks")
         return []
 
     # 0.75 is only the initial word estimate; each window is then verified with
@@ -102,7 +134,14 @@ def chunk_for_embedding(text: str) -> list[tuple[str, int]]:
         if end >= len(words):
             break
 
-        pos = max(end - overlap, pos + 1)
+        # Cap the overlap to half the words this chunk actually holds. On dense
+        # pages the shrink loop above can collapse a chunk to fewer words than
+        # `overlap`; without this cap `end - overlap` falls at/behind `pos`, the
+        # window crawls forward one word at a time, and a page explodes into
+        # hundreds of near-identical overlapping chunks. This keeps the intended
+        # overlap for normal text while guaranteeing forward progress.
+        pos = end - min(overlap, (end - pos) // 2)
 
+    print(f"[CHUNK] Page split into {len(chunks)} embedding chunk(s)")
     logger.debug("Text split into %d embedding chunks", len(chunks))
     return chunks

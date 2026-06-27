@@ -51,6 +51,7 @@ async def register_user(request: Request, payload: CreateUserRequest, db: DbDepe
 @router.post("/v1/login", response_model=Token, status_code=status.HTTP_200_OK)
 @limiter.limit("5/minute")
 async def login(request: Request, db: DbDependency, form_data: OAuth2PasswordRequestForm = Depends()):
+    print("Inside Login")
     user = await authenticate_user(form_data.username, form_data.password, db)
     if not user:
         logger.warning("Failed login attempt: username=%s", form_data.username)
@@ -61,6 +62,8 @@ async def login(request: Request, db: DbDependency, form_data: OAuth2PasswordReq
     access_token = create_access_token(user.username, user.id, user.role)
     refresh_token = await create_refresh_token(user.id, db)
     logger.info("User logged in: username=%s", user.username)
+    print("User logged in: username=%s", user.username, "Access Token Granted")
+
     return {"access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token}
 
 

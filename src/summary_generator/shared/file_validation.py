@@ -63,7 +63,10 @@ def extract_document_pages(contents: bytes, filename: str | None = None) -> tupl
     (page_number, text); empty pages are dropped. Raises HTTPException (413/415/400).
     """
     mime_type = validate_file(contents, filename)
+    print(f"[PARSE] Extracting pages from file: filename={filename} mime_type={mime_type}")
     pages = [(num, text) for num, text in extract_pages(contents, mime_type) if text.strip()]
+    total_chars = sum(len(text) for _, text in pages)
+    print(f"[PARSE] Extracted {len(pages)} non-empty page(s), total_chars={total_chars}, filename={filename}")
 
     if not pages:
         logger.warning("Rejected file: no readable text filename=%s mime_type=%s", filename, mime_type)
