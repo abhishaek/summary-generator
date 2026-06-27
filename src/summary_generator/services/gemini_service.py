@@ -10,6 +10,17 @@ from summary_generator.shared.gemini_client import client
 logger = logging.getLogger(__name__)
 
 
+class EmptyModelOutput(HTTPException):
+    """Raised when Gemini returns a response with no usable text — a safety
+    block, a MAX_TOKENS finish that emitted nothing, or a recitation stop.
+
+    It subclasses HTTPException so the summarize endpoints still render a proper
+    HTTP error with no extra handling, while the search path can catch *this
+    specific* case and degrade to a grounded "no information" reply — without
+    also swallowing rate limits or genuine API errors into that fallback.
+    """
+
+
 def _format_instructions(summary_format: str) -> str:
     if summary_format == "bullet":
         return (
@@ -64,8 +75,38 @@ async def _call_gemini(prompt: str, temperature: float | None = None) -> str:
             contents=prompt,
             config=config,
         )
+
+        # response.text is None when the model emitted no text parts — e.g. a
+        # safety block, a MAX_TOKENS finish with nothing emitted, or a recitation
+        # stop. Returning that None upward would break callers that treat it as a
+        # str far from the real cause, so surface it here where finish_reason is
+        # still available. The check also catches "" (just as useless to callers).
+        candidate = response.candidates[0] if response.candidates else None
+        finish_reason = getattr(candidate, "finish_reason", None)
+
+        if not response.text:
+            logger.warning("Gemini returned no text (finish_reason=%s)", finish_reason)
+            if str(finish_reason) == "FinishReason.MAX_TOKENS":
+                raise EmptyModelOutput(
+                    status_code=500,
+                    detail="Summary was cut off (token limit). Try a shorter input.",
+                )
+            if str(finish_reason) == "FinishReason.SAFETY":
+                raise EmptyModelOutput(
+                    status_code=400,
+                    detail="Content was blocked by the model's safety filters.",
+                )
+            raise EmptyModelOutput(
+                status_code=500,
+                detail="The model returned no usable output. Please try again.",
+            )
+
         logger.debug("Gemini API call succeeded")
         return response.text
+    except HTTPException:
+        # Our own guard above (no-text/finish_reason) — let it pass through
+        # untouched instead of being rewrapped into a generic 500 below.
+        raise
     except genai_errors.APIError as e:
         if hasattr(e, "code") and e.code == 429:
             logger.warning("Gemini rate limit hit")
@@ -143,4 +184,13 @@ async def answer_from_chunks(query: str, chunks: list[RetrievedChunk]) -> str:
         logger.info("RAG answer skipped: no chunks retrieved")
         return NO_ANSWER
     prompt = _build_rag_prompt(query, _build_rag_context(chunks))
-    return await _call_gemini(prompt, temperature=0)
+    # For search, a model that produced no text should degrade to the same
+    # "no information" reply rather than surface a 500 — gentler UX than the
+    # summarize paths. Only the empty-output case falls back; rate limits and
+    # genuine API errors (other HTTPExceptions) still propagate so the caller
+    # learns the real, retryable cause instead of a misleading "no information".
+    try:
+        return await _call_gemini(prompt, temperature=0)
+    except EmptyModelOutput:
+        logger.info("RAG answer fell back to NO_ANSWER (model produced no text)")
+        return NO_ANSWER

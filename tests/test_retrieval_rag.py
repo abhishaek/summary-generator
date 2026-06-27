@@ -73,6 +73,38 @@ async def test_answer_from_chunks_grounds_prompt_and_uses_temperature_zero(monke
     assert spy.await_args.kwargs["temperature"] == 0
 
 
+async def test_answer_from_chunks_falls_back_to_no_answer_on_empty_model_output(monkeypatch):
+    """If the model produced no usable text, _call_gemini raises EmptyModelOutput;
+    the search path degrades to NO_ANSWER rather than surfacing a 500."""
+    from summary_generator.services.gemini_service import EmptyModelOutput
+
+    monkeypatch.setattr(
+        gemini_service,
+        "_call_gemini",
+        AsyncMock(side_effect=EmptyModelOutput(status_code=500, detail="no usable output")),
+    )
+
+    result = await answer_from_chunks("anything", [_chunk()])
+
+    assert result == NO_ANSWER
+
+
+async def test_answer_from_chunks_propagates_rate_limit(monkeypatch):
+    """A genuine API error (e.g. 429) must NOT be swallowed into NO_ANSWER — the
+    caller needs to learn the real, retryable cause."""
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(
+        gemini_service,
+        "_call_gemini",
+        AsyncMock(side_effect=HTTPException(status_code=429, detail="Rate limit exceeded.")),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await answer_from_chunks("anything", [_chunk()])
+    assert exc.value.status_code == 429
+
+
 async def test_answer_from_chunks_passes_through_no_answer(monkeypatch):
     """Off-topic query: Gemini, told to refuse, returns the no-answer string and
     the service surfaces it unchanged."""
