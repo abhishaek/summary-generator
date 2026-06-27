@@ -2,7 +2,86 @@
 
 A FastAPI service which generates summary for bigger documents.
 
-It exposes JWT-authenticated endpoints to summarize text and uploaded files with Google Gemini, and to ingest documents into a pgvector store (chunked and embedded with a local sentence-transformers model) for later retrieval.
+It exposes JWT-authenticated endpoints to summarize text and uploaded files with Google Gemini, to ingest documents into a pgvector store (chunked and embedded with a local sentence-transformers model), and to run semantic search over those documents with an optional Gemini-generated answer grounded strictly in the retrieved chunks.
+
+## Architecture
+
+The diagram below shows every part of the application and how a request flows through it: the FastAPI app and its middleware, the four routers, the service layer, and the external systems (Google Gemini, the local embedding model, and PostgreSQL + pgvector).
+
+```mermaid
+flowchart TB
+    Client["Client / Browser<br/>Swagger UI at /docs"]
+
+    subgraph App["FastAPI Application (main.py)"]
+        direction TB
+        MW["CORS middleware<br/>SlowAPI rate limiter<br/>JWT auth dependency"]
+        subgraph Routers["Routers"]
+            AuthR["/auth<br/>register · login · refresh · logout"]
+            SumR["/summary<br/>/v1/text · /v1/file"]
+            DocR["/documents<br/>POST (file, 202) · /text · GET /{id}"]
+            RetR["/retrieval<br/>/v1/search (semantic + RAG)"]
+        end
+    end
+
+    subgraph Services["Service layer"]
+        AuthS["auth<br/>bcrypt · JWT · refresh tokens"]
+        GemS["gemini_service<br/>summarize · answer_from_chunks"]
+        ChunkS["chunker<br/>map-reduce + retrieval chunking<br/>+ TOC-noise stripping"]
+        EmbS["embedder<br/>sentence-transformers<br/>all-MiniLM-L6-v2 (384-dim)"]
+        DocS["document_service<br/>ingest · background process · dedup"]
+        RetS["retrieval_service<br/>cosine search + ownership guard"]
+        Parsers["parsers<br/>txt · md · html · pdf · docx"]
+    end
+
+    subgraph External["External + Storage"]
+        Gemini["Google Gemini API"]
+        PG[("PostgreSQL + pgvector<br/>users · refresh_tokens<br/>documents · document_chunks")]
+    end
+
+    Client -->|HTTP + JWT| MW --> Routers
+
+    AuthR --> AuthS --> PG
+    SumR --> Parsers
+    SumR --> GemS --> Gemini
+    DocR --> DocS
+    DocS --> Parsers
+    DocS --> ChunkS --> EmbS
+    DocS --> PG
+    RetR --> RetS
+    RetS --> EmbS
+    RetS --> PG
+    RetR --> GemS
+```
+
+### Retrieval + summarize flow
+
+This is what happens on `POST /retrieval/v1/search`. Note the early ownership guard (a bad `document_id` returns 404 before any expensive work) and the grounding step (Gemini sees only the retrieved chunks).
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as /retrieval/v1/search
+    participant RS as retrieval_service
+    participant E as embedder (MiniLM)
+    participant DB as PostgreSQL + pgvector
+    participant G as Gemini
+
+    C->>R: query, top_k, document_id?, summarize (default true)
+    R->>RS: retrieve(...)
+    alt document_id given but not owned / not DONE
+        RS-->>C: 404 (no embed, no search, no Gemini)
+    else valid or no document filter
+        RS->>E: embed query (MiniLM, normalized)
+        RS->>DB: cosine search via HNSW<br/>owner + status=DONE + similarity filter
+        DB-->>RS: top-k scored chunks
+        RS-->>R: chunks
+        opt summarize = true and chunks found
+            R->>G: grounded prompt, temperature 0
+            G-->>R: answer with [Source N] citations
+        end
+        R-->>C: results + answer + metadata
+    end
+```
 
 ## Features
 
@@ -17,11 +96,17 @@ It exposes JWT-authenticated endpoints to summarize text and uploaded files with
 - Parsers normalize whitespace; HTML strips `<script>`/`<style>`, Markdown is rendered then stripped to prose, PDF is extracted page-by-page, DOCX is extracted paragraph-by-paragraph
 - Large documents are automatically split into chunks and summarized with a map-reduce strategy when the token count exceeds 100,000 tokens
 - Document ingestion endpoints: upload a file or post raw text, which is chunked into small retrieval-sized windows, embedded locally with `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim), and stored in PostgreSQL via `pgvector`
+- Table-of-contents / index lines (dot-leader rows like `Heading .......... 42`) are stripped during chunking so they never enter the vector index and crowd out real content
 - File ingestion (`POST /documents`) runs asynchronously: the request returns `202 Accepted` immediately with a `document_id`, and the parse/chunk/embed/store work runs in a FastAPI background task; clients poll `GET /documents/{document_id}` for status
 - Ingestion status lifecycle per document: `pending` → `processing` → `done` | `failed` | `duplicate`, with the failure reason stored on the row
 - Per-user content deduplication: documents are hashed by their extracted text (sha256), so re-uploading the same content (even renamed or in a different format) is detected and not re-ingested
 - Each stored chunk keeps its source page number and character offset within the page
-- All summary and document endpoints require a valid JWT
+- Semantic search (`POST /retrieval/v1/search`): the query is embedded with the same local model and ranked against the user's own `DONE` chunks by cosine similarity using the pgvector HNSW index, with a configurable similarity floor; results are scored chunks with their document id, chunk index, and page
+- Retrieval-augmented summarization: by default the search also returns a Gemini-generated `answer` grounded strictly in the retrieved chunks — it uses only the supplied sources, cites them as `[Source N]`, runs at temperature 0, and returns a fixed "no information" message when nothing is retrieved; set `summarize: false` for a plain, faster search with no LLM call
+- Cost guard on search: a `document_id` that does not exist or is not owned by the caller returns `404` before the query is embedded or Gemini is called
+- The embedding model is warmed up at application startup so the first request does not pay the one-time load cost
+- A standard response-metadata envelope (`request_id`, `latency_ms`, `timestamp`) is returned on document and retrieval responses for tracing
+- All summary, document, and retrieval endpoints require a valid JWT
 - Rate limiting on auth endpoints: register (3/min), login (5/min), refresh (10/min), keyed by remote IP
 - CORS enabled for all origins
 - Structured JSON logging with configurable log level
@@ -32,8 +117,8 @@ It exposes JWT-authenticated endpoints to summarize text and uploaded files with
 
 ```
 src/summary_generator/
-├── main.py                        # FastAPI app, CORS, rate-limit handler, uvicorn entrypoint, GET / and /health
-├── config.py                      # Settings and environment variables (DB, JWT, Gemini, embedding)
+├── main.py                        # FastAPI app, CORS, rate-limit handler, lifespan (embedding warmup), GET / and /health
+├── config.py                      # Settings and environment variables (DB, JWT, Gemini, embedding, retrieval tuning)
 ├── database.py                    # Async SQLAlchemy engine, session factory, Base, get_db dependency
 ├── dependencies.py                # JWT validation: get_current_user, DbDependency, UserDependency
 ├── limiter.py                     # Shared slowapi Limiter instance (keyed by remote IP)
@@ -42,24 +127,28 @@ src/summary_generator/
 │   ├── __init__.py                # Exports all models
 │   ├── user.py                    # User table
 │   ├── refresh_token.py           # RefreshToken table (hashed token, expiry)
-│   └── document.py                # Document and DocumentChunk tables (pgvector embedding column); JobStatus enum, ingestion status columns
+│   └── document.py                # Document and DocumentChunk tables (pgvector embedding column); JobStatus enum
 ├── schemas/
 │   ├── __init__.py
 │   ├── auth.py                    # CreateUserRequest, UserResponse, Token, RefreshRequest
 │   ├── summary.py                 # SummaryRequest, SummaryResponse
-│   └── document.py                # DocumentTextRequest, DocumentResponse (id, filename, chunks_stored, status, error)
+│   ├── document.py                # DocumentTextRequest, DocumentResponse
+│   ├── retrieval.py               # RetrievalRequest (incl. summarize flag), RetrievedChunk, RetrievalMetadata, RetrievalResponse
+│   └── common.py                  # ResponseMetadata envelope + new_request() request stamping helper
 ├── routers/
-│   ├── __init__.py                # Aggregates auth, summary, documents routers into api_router
+│   ├── __init__.py                # Aggregates auth, summary, documents, retrieval routers into api_router
 │   ├── auth.py                    # /auth: register, login, refresh, logout
 │   ├── summary.py                 # /summary: POST /v1/text, POST /v1/file
-│   └── documents.py               # /documents: POST "" (file, async 202), POST /text, GET /{document_id} (status)
+│   ├── documents.py               # /documents: POST "" (file, async 202), POST /text, GET /{document_id}
+│   └── retrieval.py               # /retrieval: POST /v1/search (semantic search + optional grounded answer)
 ├── services/
 │   ├── __init__.py
 │   ├── auth.py                    # Password hashing, JWT creation, refresh-token helpers
-│   ├── chunker.py                 # Token counting, map-reduce splitting, retrieval-chunk splitting
-│   ├── gemini_service.py          # Gemini calls: single-pass and map-reduce summarization
-│   ├── embedder.py                # Lazy sentence-transformers singleton; embeds chunks off the event loop
-│   └── document_service.py        # ingest_document (sync, text path), process_document (background task, file path), dedup helpers
+│   ├── chunker.py                 # Token counting, map-reduce splitting, retrieval-chunk splitting, TOC-noise stripping
+│   ├── gemini_service.py          # Gemini calls: summarization, and answer_from_chunks (grounded RAG answer)
+│   ├── embedder.py                # Lazy sentence-transformers singleton; embeds chunks/query off the event loop
+│   ├── document_service.py        # ingest_document (text path), process_document (background file path), dedup helpers
+│   └── retrieval_service.py       # retrieve(): ownership guard, query embedding, pgvector cosine search
 ├── parsers/
 │   ├── __init__.py                # extract_text() and extract_pages() dispatch by MIME type
 │   ├── text.py                    # Decode and normalize plain text
@@ -78,7 +167,10 @@ tests/
 ├── conftest.py                    # Test DB engine, table create/drop, get_db override, async client fixture
 ├── test_main.py                   # Tests GET /health
 ├── test_auth.py                   # Tests /auth/register and /auth/login
-└── test_services.py               # Unit tests for hash_password, verify_password, create_access_token
+├── test_services.py               # Unit tests for hash_password, verify_password, create_access_token
+├── test_documents.py              # Response-metadata envelope unit tests + document status integration test
+├── test_chunker.py                # TOC-noise detection and stripping during retrieval chunking
+└── test_retrieval_rag.py          # Grounding, empty-retrieval short-circuit, summarize flag, 404 cost guard, end-to-end search
 pyproject.toml                     # Project config, dependencies, scripts
 .env                               # Environment variables (not committed)
 start.sh                           # Activate venv and start the server
@@ -174,6 +266,7 @@ API docs: `http://localhost:8000/docs`
 | POST | `/documents` | Yes | Accept an uploaded file for ingestion; returns `202` and processes in the background |
 | POST | `/documents/text` | Yes | Ingest raw text synchronously: chunk, embed, and store |
 | GET | `/documents/{document_id}` | Yes | Get the ingestion status and result of a document |
+| POST | `/retrieval/v1/search` | Yes | Semantic search over the caller's chunks, with an optional grounded Gemini answer |
 
 ### POST /auth/v1/register
 
@@ -292,7 +385,12 @@ Response `202`:
   "filename": "report.pdf",
   "chunks_stored": 0,
   "status": "pending",
-  "error": null
+  "error": null,
+  "metadata": {
+    "request_id": "…",
+    "latency_ms": 12.3,
+    "timestamp": "2026-06-27T12:00:00Z"
+  }
 }
 ```
 
@@ -315,7 +413,8 @@ Response `200`:
   "filename": "report.pdf",
   "chunks_stored": 12,
   "status": "done",
-  "error": null
+  "error": null,
+  "metadata": { "request_id": "…", "latency_ms": 4.1, "timestamp": "…" }
 }
 ```
 
@@ -341,6 +440,61 @@ The whole input is treated as a single page, chunked, embedded, and stored synch
 Error response:
 - `400` — empty text
 
+### POST /retrieval/v1/search
+
+Header: `Authorization: Bearer <token>`
+
+Semantic search over the caller's own `DONE` document chunks. The query is embedded with the same local model used for ingestion, then chunks are ranked by cosine similarity using the pgvector HNSW index. By default the response also includes a Gemini-generated `answer` grounded strictly in the retrieved chunks.
+
+Request body:
+```json
+{
+  "query": "How does CloudFormation work?",
+  "top_k": 10,
+  "document_id": 18,
+  "summarize": true
+}
+```
+
+- `query` (required) — the search text.
+- `top_k` (optional) — max results to return. Defaults to `5`, capped at `40`.
+- `document_id` (optional) — restrict the search to a single document the caller owns. Omit it (or send `null`) to search across all the caller's documents.
+- `summarize` (optional) — defaults to `true`. When true, also returns a grounded `answer`. Set to `false` for a plain, faster search with no LLM call.
+
+Response `200`:
+```json
+{
+  "query": "How does CloudFormation work?",
+  "results": [
+    {
+      "document_id": 18,
+      "chunk_index": 41,
+      "page_number": 12,
+      "char_start": 773,
+      "content": "CloudFormation lets you model and provision …",
+      "score": 0.62
+    }
+  ],
+  "answer": "CloudFormation lets you define infrastructure as templates … [Source 1].",
+  "metadata": {
+    "request_id": "…",
+    "latency_ms": 352.4,
+    "timestamp": "…",
+    "total_results": 1,
+    "top_k": 10,
+    "document_id": 18,
+    "min_similarity": 0.2
+  }
+}
+```
+
+Grounding guarantees: the answer uses only the returned `results` as context, cites them as `[Source N]`, and is generated at temperature 0. If no chunks pass the similarity floor, `results` is empty and `answer` is the fixed message "The provided documents do not contain information to answer this." (no Gemini call is made). When `summarize` is `false`, `answer` is `null`.
+
+An empty corpus or no matches above the similarity threshold returns `200` with an empty `results` list, not an error.
+
+Error response:
+- `404` — `document_id` was provided but does not exist, is not owned by the caller, or is not yet `done`. This check runs before the query is embedded or Gemini is called, so an invalid id never incurs that cost.
+
 ## Running Tests
 
 Tests run against a separate `summary_test_db` database. Create it first (the test connection uses user `summary_user` with password `summary123`, see `tests/conftest.py`):
@@ -363,6 +517,8 @@ Then run:
 pytest -v
 ```
 
+Some retrieval tests embed text with the real `all-MiniLM-L6-v2` model and run pgvector cosine search against the test database; the Gemini network call is mocked.
+
 ## Environment Variables
 
 Create a `.env` file in the project root:
@@ -377,11 +533,13 @@ LOG_LEVEL=INFO
 ```
 
 - `DATABASE_URL` is required — the async PostgreSQL connection string.
-- `GOOGLE_GEMINI_API_KEY` is required for summarization. Get a free key at [aistudio.google.com](https://aistudio.google.com).
+- `GOOGLE_GEMINI_API_KEY` is required for summarization and grounded search answers. Get a free key at [aistudio.google.com](https://aistudio.google.com).
 - `SECRET_KEY` is optional — a default is used if not set, but always set it in production.
 - `GEMINI_MODEL` is optional — defaults to `gemini-2.5-flash`.
 - `EMBEDDING_MODEL` is optional — defaults to `all-MiniLM-L6-v2` (384-dim). Changing it to a model with a different output dimension requires updating `EMBEDDING_DIM` in `config.py` and a new migration.
 - `LOG_LEVEL` is optional — defaults to `INFO`. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
+
+Retrieval tuning lives in `config.py` (not environment variables): `RETRIEVAL_TOP_K` (default 5), `RETRIEVAL_MAX_TOP_K` (40), `RETRIEVAL_MIN_SIMILARITY` (0.2), and the retrieval chunk sizing (`RETRIEVAL_CHUNK_TOKENS`, `RETRIEVAL_CHUNK_OVERLAP_TOKENS`).
 
 ## Database Migrations
 
@@ -390,3 +548,5 @@ LOG_LEVEL=INFO
 alembic revision --autogenerate -m "describe what changed"
 alembic upgrade head
 ```
+</content>
+</invoke>
