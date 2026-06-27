@@ -33,6 +33,18 @@ def warmup_model() -> None:
     _get_model()
 
 
+def count_embedding_tokens(text: str) -> int:
+    """Count tokens using the embedding model's *own* WordPiece tokenizer.
+
+    Gemini's count_tokens is the wrong source of truth here: the embedding model
+    (all-MiniLM-L6-v2) uses a different tokenizer and a hard 256-token input
+    limit. Special tokens ([CLS]/[SEP]) are included because they count toward
+    that limit.
+    """
+    tokenizer = _get_model().tokenizer
+    return len(tokenizer(text, add_special_tokens=True)["input_ids"])
+
+
 def _encode(chunks: list[str]) -> list[list[float]]:
     model = _get_model()
     embeddings = model.encode(chunks, normalize_embeddings=True, show_progress_bar=False)
@@ -44,3 +56,12 @@ async def embed_chunks(chunks: list[str]) -> list[list[float]]:
     thread so the async event loop is not blocked."""
     logger.debug("Embedding %d chunks", len(chunks))
     return await anyio.to_thread.run_sync(_encode, chunks)
+
+
+async def embed_query(text: str) -> list[float]:
+    """Embed a single query string into a vector, produced the same way as the
+    stored chunk vectors (same model, normalized) so cosine search is valid.
+    Runs the CPU-bound model in a worker thread so the event loop is not blocked."""
+    logger.debug("Embedding query (%d chars)", len(text))
+    vectors = await anyio.to_thread.run_sync(_encode, [text])
+    return vectors[0]
