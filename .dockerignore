@@ -1,0 +1,32 @@
+# Keep the build context small and the image clean. Anything listed here is
+# NOT sent to the Docker daemon / NOT copied by `COPY . .`.
+
+# Local virtualenv — the image builds its own venv; copying yours would clobber it.
+.venv/
+
+# Secrets — never bake these into an image. They're injected at runtime instead.
+.env
+.env.local
+
+# Python caches and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Git and editor metadata
+.git/
+.gitignore
+.vscode/
+.DS_Store
+
+# Tooling that isn't needed inside the image
+.claude/
+.pre-commit-config.yml

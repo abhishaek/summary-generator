@@ -1,0 +1,51 @@
+# docker-compose spins up your whole stack locally with one command:
+#   docker compose up --build
+# It mimics what AWS will run later: a Postgres database + your API container,
+# talking to each other over a private network.
+
+services:
+  # ---------------------------------------------------------------------------
+  # The database. We use the `pgvector` image (Postgres + the vector extension
+  # your app needs) so `CREATE EXTENSION vector` in your migrations works.
+  # In AWS this becomes RDS — same role, managed by Amazon instead.
+  # ---------------------------------------------------------------------------
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: summary
+    ports:
+      - "5432:5432"            # expose to your laptop so you can inspect with psql/DBeaver
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # persist data across `docker compose down`
+    healthcheck:
+      # `web` waits until this passes, so migrations never run against a DB
+      # that isn't ready to accept connections yet.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d summary"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Your FastAPI app, built from the Dockerfile in this directory.
+  # ---------------------------------------------------------------------------
+  web:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy   # don't start until the DB healthcheck is green
+    environment:
+      # Note the host is `db` (the service name above), NOT localhost — Compose
+      # gives each service a DNS name on the shared private network.
+      # Note `+asyncpg` — your engine is async (database.py).
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/summary
+      SECRET_KEY: local-dev-secret-change-me   # fine for local; real secret comes from Secrets Manager in AWS
+      GEMINI_MODEL: gemini-2.5-flash
+    env_file:
+      - .env                   # supplies GOOGLE_GEMINI_API_KEY from your local .env
+    ports:
+      - "8000:8000"            # http://localhost:8000
+
+volumes:
+  pgdata:                      # named volume holding the database files
