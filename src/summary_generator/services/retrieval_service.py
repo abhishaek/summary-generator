@@ -72,7 +72,7 @@ async def retrieve(
     if document_id is not None:
         stmt = stmt.where(DocumentChunk.document_id == document_id)
 
-    print(f"[RETRIEVAL 6/8] Executing vector search in DB (ranking chunks by cosine distance via <=> / HNSW index)")
+    print(f"[RETRIEVAL 6/8] Executing vector search in DB (ranking chunks by cosine distance via <=> / HNSW index)")  # noqa: F541
     rows = (await db.execute(stmt)).all()
     print(f"[RETRIEVAL 7/8] Search returned {len(rows)} chunk(s) above the similarity threshold; mapping to scored results")
     logger.info(
