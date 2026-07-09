@@ -175,6 +175,10 @@ pyproject.toml                     # Project config, dependencies, scripts
 .env                               # Environment variables (not committed)
 start.sh                           # Activate venv and start the server
 stop.sh                            # Stop the server
+Dockerfile                         # Multi-stage build; bakes in the embedding model, runs as non-root
+docker-compose.yml                 # Local stack: pgvector Postgres + the API container
+docker-entrypoint.sh               # Container startup: runs alembic migrations, then uvicorn (2 workers)
+.dockerignore                      # Excludes .venv/.git/etc. from the build context
 ```
 
 ## Requirements
@@ -250,6 +254,34 @@ Stop the server:
 ```
 
 API docs: `http://localhost:8000/docs`
+
+## Running with Docker
+
+The project ships a multi-stage `Dockerfile` and a `docker-compose.yml` that starts the API alongside a `pgvector`-enabled Postgres. This is the fastest way to run the full stack without installing Python, Postgres, or the embedding model locally.
+
+```bash
+# Provide your Gemini key (compose reads it from .env via env_file)
+echo "GOOGLE_GEMINI_API_KEY=your-gemini-api-key-here" > .env
+
+# Build and start the database + API
+docker compose up --build
+```
+
+The API is then available at `http://localhost:8000` (docs at `/docs`).
+
+Notes:
+
+- The `web` container waits for the database healthcheck, then `docker-entrypoint.sh` runs `alembic upgrade head` automatically before starting uvicorn — no manual migration step is needed.
+- The embedding model (`all-MiniLM-L6-v2`) is downloaded once at image build time and baked into the image, so containers start offline with no HuggingFace network dependency.
+- Compose sets `DATABASE_URL`, `SECRET_KEY`, and `GEMINI_MODEL` for you; only `GOOGLE_GEMINI_API_KEY` comes from your `.env`. The database is `summary` on the `db` service (user/password `postgres`/`postgres`), persisted in the `pgdata` volume.
+- The server runs with `--workers 2` and no `--reload` (production-style), and the container exposes a `/health`-based Docker healthcheck.
+
+Stop the stack:
+
+```bash
+docker compose down          # keep the database volume
+docker compose down -v       # also delete the pgdata volume
+```
 
 ## API Endpoints
 
@@ -457,7 +489,7 @@ Request body:
 ```
 
 - `query` (required) — the search text.
-- `top_k` (optional) — max results to return. Defaults to `5`, capped at `40`.
+- `top_k` (optional) — max results to return. Defaults to `10`, capped at `40`.
 - `document_id` (optional) — restrict the search to a single document the caller owns. Omit it (or send `null`) to search across all the caller's documents.
 - `summarize` (optional) — defaults to `true`. When true, also returns a grounded `answer`. Set to `false` for a plain, faster search with no LLM call.
 
@@ -539,7 +571,7 @@ LOG_LEVEL=INFO
 - `EMBEDDING_MODEL` is optional — defaults to `all-MiniLM-L6-v2` (384-dim). Changing it to a model with a different output dimension requires updating `EMBEDDING_DIM` in `config.py` and a new migration.
 - `LOG_LEVEL` is optional — defaults to `INFO`. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
 
-Retrieval tuning lives in `config.py` (not environment variables): `RETRIEVAL_TOP_K` (default 5), `RETRIEVAL_MAX_TOP_K` (40), `RETRIEVAL_MIN_SIMILARITY` (0.2), and the retrieval chunk sizing (`RETRIEVAL_CHUNK_TOKENS`, `RETRIEVAL_CHUNK_OVERLAP_TOKENS`).
+Retrieval tuning lives in `config.py` (not environment variables): `RETRIEVAL_TOP_K` (default 10), `RETRIEVAL_MAX_TOP_K` (40), `RETRIEVAL_MIN_SIMILARITY` (0.2), and the retrieval chunk sizing (`RETRIEVAL_CHUNK_TOKENS`, `RETRIEVAL_CHUNK_OVERLAP_TOKENS`).
 
 ## Database Migrations
 
